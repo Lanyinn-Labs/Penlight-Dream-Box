@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "penlight-dream-box"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "axum",
