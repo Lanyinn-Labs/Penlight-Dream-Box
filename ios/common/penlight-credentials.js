@@ -79,12 +79,6 @@ function uidFromUrl(url) {
   return match ? match[1] : "";
 }
 
-function mask(value) {
-  if (!value) return "未发现";
-  if (value.length <= 8) return "********";
-  return value.slice(0, 4) + "..." + value.slice(-4);
-}
-
 function savedJson(record) {
   return JSON.stringify(
     { uid: record.uid || "", uuid: record.uuid || "" },
@@ -123,7 +117,8 @@ function notify(title, subtitle, body, clipboardText) {
     $notification &&
     typeof $notification.post === "function"
   ) {
-    // Loon uses `clipboard`; Surge-compatible clients use action + text.
+    // These are best-effort clipboard options. Some clients silently ignore
+    // unsupported options, so the notification must also contain full JSON.
     var attach = {
       action: "clipboard",
       text: clipboardText || "",
@@ -179,13 +174,14 @@ function show(record) {
     return;
   }
 
+  // Explicit manual export only: do not log credentials on game requests.
+  if (typeof console !== "undefined" && typeof console.log === "function") {
+    console.log(text);
+  }
   notify(
     "Penlight Dream Box",
-    "已保存 UID / UUID",
-    "点击通知可复制完整 JSON\nUID: " +
-      (record.uid || "未发现") +
-      "\nUUID: " +
-      mask(record.uuid),
+    "完整 JSON（也已输出到本次脚本日志）",
+    text,
     text
   );
   finish();
@@ -196,35 +192,26 @@ var argument =
     ? $argument
     : "";
 
-if (argument === "show") {
+if (argument === "show" || typeof $request === "undefined") {
   show(readSaved());
 } else {
-  var previous = readSaved();
   var request = typeof $request !== "undefined" ? $request : null;
   var uid = uidFromUrl(request && request.url);
   var uuid = headerValue(request && request.headers, "X-Signature");
-  var current = {
-    uid: uid || previous.uid || "",
-    uuid: uuid || previous.uuid || ""
-  };
-
-  if (!current.uid && !current.uuid) {
+  // Only save a pair observed on the same request. Never combine accounts.
+  if (!uid || !uuid) {
     finish();
   } else {
+    var current = { uid: uid, uuid: uuid };
     writeStoredValue(JSON.stringify(current));
-    var changed =
-      current.uid !== previous.uid || current.uuid !== previous.uuid;
-    if (changed) {
-      notify(
-        "Penlight Dream Box",
-        "已捕获 UID / UUID（仅本机保存）",
-        "点击通知可复制完整 JSON\nUID: " +
-          (current.uid || "未发现") +
-          "\nUUID: " +
-          mask(current.uuid),
-        savedJson(current)
-      );
-    }
+    // A matching request is a fresh opportunity to export, even for the same
+    // account. Persistent value-based deduplication made repeat entry silent.
+    notify(
+      "Penlight Dream Box",
+      "已捕获完整 JSON（展开查看；复制取决于客户端支持）",
+      savedJson(current),
+      savedJson(current)
+    );
     finish();
   }
 }

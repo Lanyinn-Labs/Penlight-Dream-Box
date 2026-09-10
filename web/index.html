@@ -105,7 +105,7 @@
               <span class="paste-icon" aria-hidden="true">⌘</span>
             </div>
             <p class="panel-copy">
-              在游戏触发请求后，点击代理客户端通知复制 JSON，再粘贴到这里自动填入 UID 和 UUID。
+              在游戏触发请求后，粘贴通知中的 JSON 或 UID: / UUID: 多行文本，点击“解析并填入”即可填入 UID 和 UUID。Shadowrocket 点击未复制时，可手动运行抓取脚本，从运行日志复制。
             </p>
             <textarea
               id="credential-json"
@@ -114,7 +114,10 @@
               placeholder='{
   "uid": "123456789",
   "uuid": "..."
-}'
+}
+或：
+UID: 123456789
+UUID: 完整的 X-Signature'
             ></textarea>
             <div class="import-actions">
               <button id="parse-json" class="secondary-button" type="button">解析并填入</button>

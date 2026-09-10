@@ -138,7 +138,7 @@
   document.querySelector("#parse-json").addEventListener("click", () => {
     const raw = credentialJson.value.trim();
     if (!raw) {
-      setStatus(jsonStatus, "请先粘贴代理客户端通知中的 JSON。", "error");
+      setStatus(jsonStatus, "请先粘贴 JSON 或 UID / UUID 多行文本。", "error");
       return;
     }
 
@@ -146,14 +146,18 @@
     try {
       parsed = JSON.parse(raw);
     } catch (_) {
-      setStatus(jsonStatus, "JSON 格式不正确，请检查复制内容。", "error");
-      return;
+      // Accept notification text as well as JSON, including Chinese colons.
+      parsed = {};
+      for (const line of raw.split(/\r?\n|\r/)) {
+        const match = line.match(/^\s*(uid|uuid)\s*[:：]\s*(.*?)\s*$/i);
+        if (match) parsed[match[1].toLowerCase()] = match[2];
+      }
     }
 
     const uid = findValue(parsed, ["uid", "userid", "user_id"]);
     const uuid = findValue(parsed, ["uuid", "deviceuuid", "device_uuid"]);
     if (!uid || !uuid) {
-      setStatus(jsonStatus, "没有找到 uid 和 uuid，请粘贴代理客户端通知中的完整 JSON。", "error");
+      setStatus(jsonStatus, "没有找到完整的 UID 和 UUID，请粘贴 JSON 或分别以 UID:、UUID: 开头的两行文本。", "error");
       return;
     }
 
