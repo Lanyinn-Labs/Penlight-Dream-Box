@@ -205,6 +205,8 @@ Content-Type: application/json
 和 `exclude`。其中 `ep` 由玩家剧情记录与卡牌主数据交叉计算。
 `train` 根据 `trainingStatus` 判断，`art` 直接根据 API 的 `illust` 判断：
 `normal` 为 0，`after_training` 为 1。
+`trainingStatus: "done"` 表示已特训；即使选择特训前卡面（`illust: "normal"`），
+也会导出为 `train: 1, art: 0`，保留已特训状态。
 Bestdori 内部的 `skill` 使用 0–4，Dream-API 的 `skillLevel` 使用 1–5，导出时会减 1。
 
 ### GET /api/monthlyRanking/info 与 /api/monthlyRanking/info.json

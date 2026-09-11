@@ -202,7 +202,7 @@ fn card_entry(
     let training_status = string_field(entry, "trainingStatus").to_ascii_lowercase();
     let trained = matches!(
         training_status.as_str(),
-        "completed" | "complete" | "trained" | "training_completed" | "after_training"
+        "done" | "completed" | "complete" | "trained" | "training_completed" | "after_training"
     );
     let after_training = string_field(entry, "illust") == "after_training";
     let trained = trained || after_training;
@@ -416,6 +416,42 @@ mod tests {
         assert_eq!(result["cards"][0]["art"], 0);
         assert_eq!(result["cards"][0]["exclude"], false);
         assert_eq!(result["items"]["potentials"].as_array().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn trained_card_keeps_training_when_switching_illustrations() {
+        for (illust, expected_art) in [("normal", 0), ("after_training", 1)] {
+            let result = build_profile(
+                &json!({}),
+                &json!({ "entries": [{
+                    "situationId": 1001,
+                    "trainingStatus": "done",
+                    "illust": illust
+                }] }),
+                &json!({ "entries": [] }),
+                &json!({ "entries": [] }),
+            );
+
+            assert_eq!(result["cards"][0]["train"], 1);
+            assert_eq!(result["cards"][0]["art"], expected_art);
+        }
+    }
+
+    #[test]
+    fn untrained_card_remains_untrained() {
+        let card = card_entry(
+            &json!({
+                "situationId": 1001,
+                "trainingStatus": "not_yet",
+                "illust": "normal"
+            }),
+            &HashSet::new(),
+            &json!({}),
+        )
+        .unwrap();
+
+        assert_eq!(card["train"], 0);
+        assert_eq!(card["art"], 0);
     }
 
     #[test]
