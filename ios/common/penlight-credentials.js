@@ -12,6 +12,37 @@ function finish(result) {
   if (typeof $done === "function") $done(result || {});
 }
 
+function hasSurgeVersion() {
+  return (
+    typeof $environment !== "undefined" &&
+    $environment &&
+    typeof $environment["surge-version"] !== "undefined"
+  );
+}
+
+function hasStashVersion() {
+  return (
+    typeof $environment !== "undefined" &&
+    $environment &&
+    typeof $environment["stash-version"] !== "undefined"
+  );
+}
+
+function isStashTile() {
+  return (
+    typeof $script !== "undefined" &&
+    $script &&
+    $script.type === "tile"
+  );
+}
+
+function isLoonGeneric() {
+  return (
+    typeof $loon !== "undefined" &&
+    (typeof $request === "undefined" || !$request || !$request.url)
+  );
+}
+
 function readStoredValue() {
   if (
     typeof $prefs !== "undefined" &&
@@ -60,7 +91,7 @@ function readSaved() {
 }
 
 function headerValue(headers, wantedName) {
-  if (!headers) return "";
+  if (!headers || typeof headers !== "object") return "";
   var wanted = wantedName.toLowerCase();
   for (var name in headers) {
     if (!Object.prototype.hasOwnProperty.call(headers, name)) continue;
@@ -87,29 +118,36 @@ function savedJson(record) {
   );
 }
 
-function isStashTile() {
-  return (
-    typeof $script !== "undefined" &&
-    $script &&
-    $script.type === "tile"
-  );
+function postNotification(title, subtitle, body, options) {
+  if (options) {
+    try {
+      $notification.post(title, subtitle, body, options);
+      return;
+    } catch (_) {}
+  }
+  try {
+    $notification.post(title, subtitle, body);
+  } catch (_) {}
 }
 
 function notify(title, subtitle, body, clipboardText) {
+  var text = clipboardText ? String(clipboardText) : "";
+
   // Quantumult X supports updating the pasteboard after the notification is
-  // tapped. The fourth argument is ignored by older QX builds.
+  // tapped. Omit the fourth argument when empty or on older QX builds.
   if (typeof $notify === "function") {
-    try {
-      $notify(title, subtitle, body, {
-        "update-pasteboard": clipboardText || ""
-      });
-      return;
-    } catch (_) {
+    if (text) {
       try {
-        $notify(title, subtitle, body);
+        $notify(title, subtitle, body, {
+          "update-pasteboard": text
+        });
         return;
       } catch (_) {}
     }
+    try {
+      $notify(title, subtitle, body);
+    } catch (_) {}
+    return;
   }
 
   if (
@@ -117,60 +155,83 @@ function notify(title, subtitle, body, clipboardText) {
     $notification &&
     typeof $notification.post === "function"
   ) {
-    // These are best-effort clipboard options. Some clients silently ignore
-    // unsupported options, so the notification must also contain full JSON.
-    var attach = {
-      action: "clipboard",
-      text: clipboardText || "",
-      clipboard: clipboardText || ""
-    };
+    // Pass only the attachment keys documented by each client so strict native
+    // bridges do not drop notifications or fail with empty clipboard strings.
+    if (!text || hasStashVersion()) {
+      postNotification(title, subtitle, body, null);
+      return;
+    }
+
+    if (hasSurgeVersion()) {
+      postNotification(title, subtitle, body, {
+        action: "clipboard",
+        text: text
+      });
+      return;
+    }
+
+    if (typeof $loon !== "undefined") {
+      postNotification(title, subtitle, body, {
+        clipboard: text
+      });
+      return;
+    }
+
+    // Shadowrocket and generic clients: keep best-effort options while falling
+    // back cleanly if a client rejects unknown attachment keys.
     try {
-      $notification.post(title, subtitle, body, attach);
+      $notification.post(title, subtitle, body, {
+        action: "clipboard",
+        text: text,
+        clipboard: text
+      });
       return;
     } catch (_) {
-      try {
-        $notification.post(title, subtitle, body, {
-          clipboard: clipboardText || ""
-        });
-        return;
-      } catch (_) {
-        try {
-          $notification.post(title, subtitle, body);
-        } catch (_) {}
-      }
+      postNotification(title, subtitle, body, {
+        clipboard: text
+      });
     }
   }
 }
 
 function show(record) {
   var text = savedJson(record);
-  if (!record.uid && !record.uuid) {
-    if (isStashTile()) {
-      finish({
-        title: "Penlight UID / UUID",
-        content: "还没有捕获到 UID / UUID",
-        icon: "exclamationmark.circle",
-        backgroundColor: "#8e8e93"
-      });
-    } else {
-      notify(
-        "Penlight Dream Box",
-        "还没有捕获到 UID / UUID",
-        "请打开游戏并进入个人资料或其他会访问 api.garupa.jp 的页面。",
-        ""
-      );
-      finish();
-    }
+  var hasRecord = Boolean(record.uid || record.uuid);
+
+  if (isStashTile()) {
+    finish(
+      hasRecord
+        ? {
+            title: "Penlight UID / UUID",
+            content: text,
+            icon: "doc.on.clipboard",
+            backgroundColor: "#1d1d1f"
+          }
+        : {
+            title: "Penlight UID / UUID",
+            content: "还没有捕获到 UID / UUID",
+            icon: "exclamationmark.circle",
+            backgroundColor: "#8e8e93"
+          }
+    );
     return;
   }
 
-  if (isStashTile()) {
-    finish({
-      title: "Penlight UID / UUID",
-      content: text,
-      icon: "doc.on.clipboard",
-      backgroundColor: "#1d1d1f"
-    });
+  if (!hasRecord) {
+    notify(
+      "Penlight Dream Box",
+      "还没有捕获到 UID / UUID",
+      "请打开游戏并进入个人资料或其他会访问 api.garupa.jp 的页面。",
+      ""
+    );
+    finish(
+      isLoonGeneric()
+        ? {
+            title: "Penlight UID / UUID",
+            content: "还没有捕获到 UID / UUID"
+          }
+        : {}
+    );
     return;
   }
 
@@ -184,20 +245,44 @@ function show(record) {
     text,
     text
   );
-  finish();
+  finish(
+    isLoonGeneric()
+      ? {
+          title: "Penlight UID / UUID",
+          content: text
+        }
+      : {}
+  );
+}
+
+function normalizeArgument(value) {
+  if (typeof value === "string") {
+    var trimmed = value.trim().replace(/^(['"])(.*)\1$/, "$2").trim();
+    if (trimmed === "show" || trimmed === "capture") return trimmed;
+    if (trimmed.charAt(0) === "{") {
+      try {
+        return normalizeArgument(JSON.parse(trimmed));
+      } catch (_) {}
+    }
+    return trimmed;
+  }
+  if (value && typeof value === "object") {
+    if (value.show === true) return "show";
+    var candidate = value.mode || value.action || value.argument;
+    if (typeof candidate === "string") return normalizeArgument(candidate);
+  }
+  return "";
 }
 
 var argument =
-  typeof $argument !== "undefined" && typeof $argument === "string"
-    ? $argument.trim().replace(/^(['"])(.*)\1$/, "$2").trim()
-    : "";
+  typeof $argument !== "undefined" ? normalizeArgument($argument) : "";
+var request = typeof $request !== "undefined" ? $request : null;
 
-if (argument === "show" || typeof $request === "undefined") {
+if (argument === "show" || !request || !request.url) {
   show(readSaved());
 } else {
-  var request = typeof $request !== "undefined" ? $request : null;
-  var uid = uidFromUrl(request && request.url);
-  var uuid = headerValue(request && request.headers, "X-Signature");
+  var uid = uidFromUrl(request.url);
+  var uuid = headerValue(request.headers, "X-Signature");
   // Only save a pair observed on the same request. Never combine accounts.
   if (!uid || !uuid) {
     finish();

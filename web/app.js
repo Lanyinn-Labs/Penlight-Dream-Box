@@ -54,7 +54,10 @@
 
   const quantumultResource = encodeURIComponent(
     JSON.stringify({
-      rewrite_remote: [moduleUrls.quantumultx + ", tag=Penlight Dream Box"],
+      rewrite_remote: [
+        moduleUrls.quantumultx +
+          ", tag=Penlight Dream Box, update-interval=86400, opt-parser=false, enabled=true",
+      ],
     }),
   );
   const moduleInstallUrls = {
@@ -64,8 +67,7 @@
     stash: "stash://install-override?url=" + encodeURIComponent(moduleUrls.stash),
     loon: "loon://import?plugin=" + encodeURIComponent(moduleUrls.loon),
     quantumultx:
-      "https://quantumult.app/x/open-app/add-resource?remote-resource=" +
-      quantumultResource,
+      "quantumult-x:///add-resource?remote-resource=" + quantumultResource,
   };
 
   document.querySelectorAll("[data-install-client]").forEach((link) => {
