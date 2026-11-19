@@ -1,3 +1,6 @@
 /target
 .env
 *.log
+bestdori-profile*.json
+user-decks-*.json
+user-situations-*.json
