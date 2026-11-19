@@ -190,8 +190,9 @@ Content-Type: application/json
 `GARUPA_ENCRYPTION_IVS` 解密官方响应。响应带
 `Content-Disposition: attachment`，文件名为 `bestdori-profile-<uid>.json`。
 
-网页入口位于 `/`，Loon 插件输出的 `{ "uid": "...", "uuid": "..." }` 可以
-直接粘贴到网页的 JSON 框中；解析只在浏览器中完成，不会单独上传这段文本。
+网页入口位于 `/`，支持将 Shadowrocket、Surge、Stash、Loon、Quantumult X
+导出的 `{ "uid": "...", "uuid": "..." }` JSON 或 `UID:` / `UUID:` 多行文本
+直接粘贴到网页输入框中；解析只在浏览器中完成，不会单独上传这段文本。
 
 `cards`、基建和角色潜能均来自官方 API 的解码结果（动态 POST 路径由 Box
 直接请求；旧 GET 路径经 Dream-API）。基建读取 `user/areas` 返回的
@@ -268,7 +269,7 @@ curl http://127.0.0.1:8081/api/monthlyRanking/all.json
 | `server` | 是 | 无 | 服务器，仅 `0` |
 | `monthlyId` | 否 | 当前进行中的月榜 | 月榜 ID，>= 1 |
 | `interval` | 否 | 60000 | 输出重采样间隔，毫秒，>= 1 |
-| `since` | 否 | 0 | 只返回该时间之后的点，毫秒，>= 0 |
+| `since` | 否 | 0 | 起始时间（包含该时间点，即 `time >= since`），毫秒，>= 0 |
 
 请求：
 
@@ -340,7 +341,7 @@ curl "http://127.0.0.1:8081/api/monthlyRanking/border?server=0&monthlyId=2&tier=
 | `event` | 是 | 无 | 活动 ID，>= 1 |
 | `mid` | 否 | 0 | 歌曲 ID，0 或缺省为活动榜，>= 1 为歌榜 |
 | `interval` | 否 | 60000 | 输出重采样间隔，毫秒，>= 1 |
-| `since` | 否 | 0 | 只返回该时间之后的点，毫秒，>= 0 |
+| `since` | 否 | 0 | 起始时间（包含该时间点，即 `time >= since`），毫秒，>= 0 |
 
 请求：
 

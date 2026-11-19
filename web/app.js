@@ -90,7 +90,9 @@
   function setPlatform(platform) {
     platformInput.value = platform;
     document.querySelectorAll("[data-platform]").forEach((button) => {
-      button.classList.toggle("is-selected", button.dataset.platform === platform);
+      const selected = button.dataset.platform === platform;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-pressed", String(selected));
     });
   }
 
@@ -230,7 +232,7 @@
       document.body.appendChild(link);
       link.click();
       link.remove();
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
       setStatus(formStatus, "资料已生成，正在下载。", "success");
     } catch (error) {
       setStatus(formStatus, error.message || "导出失败，请稍后重试。", "error");

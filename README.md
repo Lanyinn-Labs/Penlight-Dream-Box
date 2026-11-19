@@ -1,6 +1,6 @@
 # Penlight-Dream-Box
 
-Garupa  API 聚合服务。
+Garupa API 聚合服务。
 
 ## 快速开始
 
@@ -19,7 +19,8 @@ curl http://127.0.0.1:8081/health
 
 
 旧的 `GET /api/profile/export.json` 仍然保留，读取的是 Dream-API `.env`
-中配置的固定玩家，方便脚本兼容；网页和上面的 POST 调用支持切换玩家。
+中配置的固定玩家，方便脚本兼容；网页首页和 `POST /api/profile/export.json`
+支持按请求参数切换玩家，完整接口说明见 [`docs/api.md`](docs/api.md)。
 
 Android 的客户端版本默认复用 `GARUPA_CLIENT_VERSIONS`，如果 Android 与
 iOS 版本不同，请设置 `GARUPA_ANDROID_CLIENT_VERSIONS`。

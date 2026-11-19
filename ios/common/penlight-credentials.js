@@ -189,7 +189,7 @@ function show(record) {
 
 var argument =
   typeof $argument !== "undefined" && typeof $argument === "string"
-    ? $argument
+    ? $argument.trim().replace(/^(['"])(.*)\1$/, "$2").trim()
     : "";
 
 if (argument === "show" || typeof $request === "undefined") {

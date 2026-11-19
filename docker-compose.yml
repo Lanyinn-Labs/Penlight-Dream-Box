@@ -16,6 +16,12 @@ services:
     container_name: penlight-dream-mongodb
     restart: unless-stopped
     command: mongod --wiredTigerCacheSizeGB 0.25 --bind_ip_all
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     volumes:
       - mongo-data:/data/db
     networks:
@@ -27,19 +33,22 @@ services:
     container_name: penlight-dream-box
     restart: unless-stopped
     depends_on:
-      - dream-api
-      - mongodb
+      dream-api:
+        condition: service_started
+      mongodb:
+        condition: service_healthy
     environment:
       BOX_HOST: 0.0.0.0
       BOX_PORT: 8080
       BOX_API_PREFIX: /api
       DREAM_API_BASE: http://dream-api:8080/api
       DREAM_API_KEY: ${DREAM_API_KEY:-}
+      DREAM_API_TIMEOUT_SECS: ${DREAM_API_TIMEOUT_SECS:-30}
       GARUPA_SERVER_BASES: ${GARUPA_SERVER_BASES:-api.garupa.jp}
       GARUPA_ENCRYPTION_KEYS: ${GARUPA_ENCRYPTION_KEYS:-}
       GARUPA_ENCRYPTION_IVS: ${GARUPA_ENCRYPTION_IVS:-}
-      GARUPA_CLIENT_VERSIONS: ${GARUPA_CLIENT_VERSIONS:-10.1.3}
-      GARUPA_ANDROID_CLIENT_VERSIONS: ${GARUPA_ANDROID_CLIENT_VERSIONS:-10.1.3}
+      GARUPA_CLIENT_VERSIONS: ${GARUPA_CLIENT_VERSIONS:-10.2.1}
+      GARUPA_ANDROID_CLIENT_VERSIONS: ${GARUPA_ANDROID_CLIENT_VERSIONS:-10.2.2}
       GARUPA_UNITY_VERSIONS: ${GARUPA_UNITY_VERSIONS:-2021.3.45f2}
       GARUPA_USER_AGENTS: ${GARUPA_USER_AGENTS:-}
       GARUPA_PACKAGE_URLS: ${GARUPA_PACKAGE_URLS:-https://itunes.apple.com/jp/lookup?bundleId=jp.co.craftegg.band}
@@ -51,6 +60,7 @@ services:
       MASTER_INTERVAL_SECS: ${MASTER_INTERVAL_SECS:-3600}
       POST_END_WINDOW_SECS: ${POST_END_WINDOW_SECS:-3600}
       API_KEY: ${API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "${BOX_PORT:-8081}:8080"
     networks:
