@@ -1,6 +1,7 @@
 //! Runtime configuration from environment variables.
 //!
-//! Prefers local overrides `.env.local`, then `.env`, then `.env.example`.
+//! Loads variables from `.env` (if present) with process environment overrides
+//! and built-in fallback defaults.
 
 use std::time::Duration;
 
@@ -46,6 +47,15 @@ fn get_optional_bytes(name: &str) -> Option<Vec<u8>> {
         .ok()
         .map(|value| value.trim().as_bytes().to_vec())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_api_prefix(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 fn normalize_garupa_base(raw: &str) -> String {
@@ -115,15 +125,15 @@ pub struct Config {
 
 /// Loads configuration from the environment.
 pub fn load() -> Config {
-    // `.env.local` > `.env` > `.env.example`.
+    // Load `.env` if present; process environment variables take precedence.
     dotenv().ok();
 
     Config {
         host: get_first(&["BOX_HOST", "HOST"], "127.0.0.1"),
-        port: get_first_u16(&["BOX_PORT", "PORT"], 8080),
-        api_prefix: get_first(&["BOX_API_PREFIX", "API_PREFIX"], "/api"),
+        port: get_first_u16(&["BOX_PORT", "PORT"], 8081),
+        api_prefix: normalize_api_prefix(&get_first(&["BOX_API_PREFIX", "API_PREFIX"], "/api")),
 
-        dream_api_base: get("DREAM_API_BASE", "http://127.0.0.1:8081/api")
+        dream_api_base: get("DREAM_API_BASE", "http://127.0.0.1:8080/api")
             .trim_end_matches('/')
             .to_string(),
         dream_api_key: {
@@ -154,10 +164,10 @@ pub fn load() -> Config {
         garupa_base: normalize_garupa_base(&get("GARUPA_SERVER_BASES", "api.garupa.jp")),
         garupa_encryption_key: get_optional_bytes("GARUPA_ENCRYPTION_KEYS"),
         garupa_encryption_iv: get_optional_bytes("GARUPA_ENCRYPTION_IVS"),
-        garupa_client_version: get_first(&["GARUPA_CLIENT_VERSIONS"], "10.1.3"),
+        garupa_client_version: get_first(&["GARUPA_CLIENT_VERSIONS"], "10.2.1"),
         garupa_android_client_version: get_first(
             &["GARUPA_ANDROID_CLIENT_VERSIONS", "GARUPA_CLIENT_VERSIONS"],
-            "10.1.3",
+            "10.2.2",
         ),
         garupa_unity_version: get_first(&["GARUPA_UNITY_VERSIONS"], "2021.3.45f2"),
         garupa_user_agent: {
@@ -176,5 +186,37 @@ pub fn load() -> Config {
             get_u64("DREAM_API_TIMEOUT_SECS", 30),
         )),
         garupa_version_ttl: Duration::from_secs(get_u64("GARUPA_VERSION_TTL_SECONDS", 3600)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_api_prefix_without_panicking_on_root() {
+        assert_eq!(normalize_api_prefix("/"), "/");
+        assert_eq!(normalize_api_prefix("///"), "/");
+        assert_eq!(normalize_api_prefix("  "), "/");
+        assert_eq!(normalize_api_prefix("api"), "/api");
+        assert_eq!(normalize_api_prefix("/api/"), "/api");
+        assert_eq!(normalize_api_prefix("/v1/api/"), "/v1/api");
+    }
+
+    #[test]
+    fn normalizes_garupa_base() {
+        assert_eq!(
+            normalize_garupa_base("api.garupa.jp"),
+            "https://api.garupa.jp/api/"
+        );
+        assert_eq!(
+            normalize_garupa_base("https://api.garupa.jp/api/"),
+            "https://api.garupa.jp/api/"
+        );
+        assert_eq!(
+            normalize_garupa_base("http://127.0.0.1:8080/"),
+            "http://127.0.0.1:8080/api/"
+        );
+        assert_eq!(normalize_garupa_base("   "), "");
     }
 }

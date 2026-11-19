@@ -5,7 +5,7 @@
 //! into that format. The endpoint only generates a file; it does not attempt
 //! to access Bestdori cookies or browser localStorage.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::body::Body;
 use axum::extract::{Json, State};
@@ -170,13 +170,14 @@ fn build_profile_with_user_data(
         });
 
     let unlocked_episodes = episode_ids(episodes);
+    let card_episodes = card_episode_index(card_master);
     let cards = situations
         .get("entries")
         .and_then(Value::as_array)
         .map(|entries| {
             entries
                 .iter()
-                .filter_map(|entry| card_entry(entry, &unlocked_episodes, card_master))
+                .filter_map(|entry| card_entry(entry, &unlocked_episodes, &card_episodes))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -192,7 +193,7 @@ fn build_profile_with_user_data(
 fn card_entry(
     entry: &Value,
     unlocked_episodes: &HashSet<i64>,
-    card_master: &Value,
+    card_episodes: &HashMap<i64, Vec<i64>>,
 ) -> Option<Value> {
     let id = i64_field(entry, "situationId");
     if id < 1 {
@@ -214,7 +215,7 @@ fn card_entry(
         // Dream-API exposes the game's Lv.1..5 value. Bestdori stores the
         // zero-based value and displays it as `skill + 1`.
         "skill": non_negative(i64_field(entry, "skillLevel") - 1),
-        "ep": episode_count(id, unlocked_episodes, card_master),
+        "ep": episode_count(id, unlocked_episodes, card_episodes),
         "train": if trained { 1 } else { 0 },
         "art": if after_training { 1 } else { 0 },
         "exclude": false,
@@ -222,6 +223,10 @@ fn card_entry(
 }
 
 fn episode_ids(episodes: &Value) -> HashSet<i64> {
+    // Keep all positive episodeId entries without filtering on `status`:
+    // `schema.rs` decodes `status` as an unenumerated string and Garupa/Dream-API
+    // representations can differ (e.g. "read" vs "already_read"), so strict
+    // string matching could drop valid unlocked episodes.
     episodes
         .get("entries")
         .and_then(Value::as_array)
@@ -234,20 +239,44 @@ fn episode_ids(episodes: &Value) -> HashSet<i64> {
         .collect()
 }
 
-fn episode_count(card_id: i64, unlocked_episodes: &HashSet<i64>, card_master: &Value) -> i64 {
-    card_master
-        .get("entries")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|card| i64_field(card, "situationId") == card_id)
-        .and_then(|card| card.get("episodes"))
-        .and_then(|episodes| episodes.get("entries"))
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
+fn card_episode_index(card_master: &Value) -> HashMap<i64, Vec<i64>> {
+    let mut index = HashMap::new();
+    let Some(entries) = card_master.get("entries").and_then(Value::as_array) else {
+        return index;
+    };
+    for card in entries {
+        let card_id = i64_field(card, "situationId");
+        if card_id < 1 {
+            continue;
+        }
+        let episodes = card
+            .get("episodes")
+            .and_then(|episodes| episodes.get("entries"))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|episode| i64_field(episode, "episodeId"))
+                    .filter(|&id| id > 0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        index.entry(card_id).or_insert(episodes);
+    }
+    index
+}
+
+fn episode_count(
+    card_id: i64,
+    unlocked_episodes: &HashSet<i64>,
+    card_episodes: &HashMap<i64, Vec<i64>>,
+) -> i64 {
+    card_episodes
+        .get(&card_id)
+        .map(|episodes| {
+            episodes
                 .iter()
-                .filter(|episode| unlocked_episodes.contains(&i64_field(episode, "episodeId")))
+                .filter(|episode_id| unlocked_episodes.contains(episode_id))
                 .count() as i64
         })
         .unwrap_or(0)
@@ -291,7 +320,11 @@ fn items_from_user_data(areas: &Value, characters: &Value) -> Map<String, Value>
             let Some(values) = items.get_mut(*name).and_then(Value::as_array_mut) else {
                 continue;
             };
-            values[index] = Value::from(non_negative(level - 1));
+            let mapped = non_negative(level - 1);
+            let next = values[index]
+                .as_i64()
+                .map_or(mapped, |existing| existing.max(mapped));
+            values[index] = Value::from(next);
         }
     }
 
@@ -446,7 +479,7 @@ mod tests {
                 "illust": "normal"
             }),
             &HashSet::new(),
-            &json!({}),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -510,5 +543,39 @@ mod tests {
         assert_eq!(result["items"]["Afterglow"][0], Value::Null);
         assert_eq!(result["items"]["potentials"][0], 55);
         assert_eq!(result["items"]["potentials"][39], 120);
+    }
+
+    #[test]
+    fn duplicate_area_item_categories_keep_max_level_and_card_episode_index_counts() {
+        let areas = json!({
+            "entries": [
+                { "areaItemCategory": 1, "level": 3 },
+                { "areaItemCategory": 1, "level": 8 },
+                { "areaItemCategory": 1, "level": 5 },
+                { "areaItemCategory": 2, "level": 6 },
+                { "areaItemCategory": 2, "level": 2 }
+            ]
+        });
+        let items = items_from_user_data(&areas, &json!({ "entries": [] }));
+        assert_eq!(items["PoppinParty"][0], 7);
+        assert_eq!(items["PoppinParty"][1], 5);
+
+        let card_master = json!({
+            "entries": [
+                {
+                    "situationId": 1001,
+                    "episodes": { "entries": [{ "episodeId": 10 }, { "episodeId": 11 }] }
+                },
+                {
+                    "situationId": 1002,
+                    "episodes": { "entries": [{ "episodeId": 20 }] }
+                }
+            ]
+        });
+        let index = card_episode_index(&card_master);
+        let unlocked = HashSet::from([10, 20]);
+        assert_eq!(episode_count(1001, &unlocked, &index), 1);
+        assert_eq!(episode_count(1002, &unlocked, &index), 1);
+        assert_eq!(episode_count(9999, &unlocked, &index), 0);
     }
 }

@@ -295,14 +295,15 @@ impl ProfileClient {
             }
         }
 
-        let version = self
-            .fetch_store_version()
-            .await
-            .unwrap_or_else(|| configured.clone());
-        if let Ok(mut cache) = self.version_cache.lock() {
-            *cache = Some((version.clone(), Instant::now()));
+        match self.fetch_store_version().await {
+            Some(version) => {
+                if let Ok(mut cache) = self.version_cache.lock() {
+                    *cache = Some((version.clone(), Instant::now()));
+                }
+                version
+            }
+            None => configured.clone(),
         }
-        version
     }
 
     async fn fetch_store_version(&self) -> Option<String> {
@@ -598,5 +599,74 @@ mod tests {
                 assert_eq!(version, "test-android");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn transient_store_lookup_failure_is_not_cached_and_subsequent_success_is_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/lookup",
+                axum::routing::get(move || {
+                    let server_calls = server_calls.clone();
+                    async move {
+                        let attempt = server_calls.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            (StatusCode::INTERNAL_SERVER_ERROR, Body::empty()).into_response()
+                        } else {
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({ "results": [{ "version": "10.2.1" }] })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = ProfileClient {
+            http: reqwest::Client::new(),
+            base: String::new(),
+            encryption_key: None,
+            encryption_iv: None,
+            client_version: "fallback-ios".to_string(),
+            android_client_version: "10.2.2".to_string(),
+            unity_version: "test-unity".to_string(),
+            user_agent: "test-agent".to_string(),
+            package_url: format!("http://{address}/lookup"),
+            version_ttl: Duration::from_secs(3600),
+            version_cache: Arc::new(Mutex::new(None)),
+        };
+
+        // Transient failure returns fallback without caching it.
+        assert_eq!(client.client_version(Platform::Ios).await, "fallback-ios");
+        assert!(client.version_cache.lock().unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Subsequent lookup succeeds and caches the fetched version.
+        assert_eq!(client.client_version(Platform::Ios).await, "10.2.1");
+        assert_eq!(
+            client
+                .version_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(v, _)| v.as_str()),
+            Some("10.2.1")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Third call serves from cache without hitting the lookup endpoint again.
+        assert_eq!(client.client_version(Platform::Ios).await, "10.2.1");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        server.abort();
     }
 }

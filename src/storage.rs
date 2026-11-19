@@ -2,7 +2,7 @@
 //! profiles, and master info, mirroring GarupaSpeedTracker's storage semantics
 //! with per-day buckets, per-server+uid player upserts, per-tier cutoff series.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use bson::doc;
 use futures::TryStreamExt;
@@ -416,8 +416,8 @@ impl Storage {
     // Monthly ranking snapshots
     // -----------------------------------------------------------------------
 
-    /// Appends a top
-    /// snapshot for `` and upserts player profiles.
+    /// Appends a top snapshot for `server` and `monthly_id`, and upserts
+    /// player profiles.
     pub async fn append_monthly_top(
         &self,
         server: i64,
@@ -427,12 +427,6 @@ impl Storage {
     ) -> AppResult<usize> {
         let bucket = utc_bucket(ts);
         let filter = doc! { "server": server, "monthlyId": monthly_id, "bucket": bucket };
-        let existing = self
-            .monthly_top
-            .find_one(filter.clone())
-            .await
-            .map_err(|e| AppError::internal(format!("monthly top query failed: {e}")))?;
-
         let points: Vec<TopPoint> = users
             .iter()
             .map(|u| TopPoint {
@@ -444,53 +438,25 @@ impl Storage {
         let points_bson = serde_to_bson(&points)?;
         let n = points.len();
 
-        match existing {
-            None => {
-                let doc = doc! {
-                    "server": server, "monthlyId": monthly_id, "bucket": bucket,
-                    "points": points_bson,
-                    "updatedAt": ts,
-                };
-                self.monthly_top
-                    .insert_one(doc)
-                    .await
-                    .map_err(|e| AppError::internal(format!("monthly top insert failed: {e}")))?;
-            }
-            Some(doc) => {
-                let last = doc.get_i64("updatedAt").unwrap_or(0);
-                let update = if last < ts {
-                    // Append when the new timestamp is newer.
-                    doc! {
-                        "$set": { "updatedAt": ts },
-                        "$push": { "points": { "$each": points_bson } },
-                    }
-                } else {
-                    // Same timestamp e.g. post-end clamp: replace to stay idempotent.
-                    doc! { "$set": { "points": points_bson, "updatedAt": ts } }
-                };
-                self.monthly_top
-                    .update_one(filter, update)
-                    .await
-                    .map_err(|e| AppError::internal(format!("monthly top update failed: {e}")))?;
-            }
+        let wrote = self
+            .upsert_time_series(
+                &self.monthly_top,
+                filter,
+                "points",
+                ts,
+                points_bson,
+                "monthly top",
+            )
+            .await?;
+        if !wrote {
+            return Ok(0);
         }
 
-        // Upsert player profiles.
-        let writes = users.iter().map(|u| {
-            let p = PlayerDoc::from_user(server, u, ts);
-            self.players
-                .replace_one(doc! { "server": server, "uid": u.uid }, p)
-                .upsert(true)
-        });
-        for w in writes {
-            w.await
-                .map_err(|e| AppError::internal(format!("player upsert failed: {e}")))?;
-        }
-
+        self.upsert_players(server, users, ts).await?;
         Ok(n)
     }
 
-    /// Full monthly top history for ``: points sorted by
+    /// Full monthly top history for `server` and `monthly_id`: points sorted by
     /// time plus the latest player profiles of the involved users.
     pub async fn monthly_top(
         &self,
@@ -499,57 +465,15 @@ impl Storage {
         since: i64,
     ) -> AppResult<(Vec<TopPoint>, Vec<PlayerDoc>)> {
         let filter = if since > 0 {
-            doc! { "server": server, "monthlyId": monthly_id, "bucket": { "$gte": since / 86_400_000 } }
+            doc! { "server": server, "monthlyId": monthly_id, "bucket": { "$gte": utc_bucket(since) } }
         } else {
             doc! { "server": server, "monthlyId": monthly_id }
         };
-        let cursor = self
-            .monthly_top
-            .find(filter)
+        self.query_top_points(&self.monthly_top, filter, server, since, "monthly top")
             .await
-            .map_err(|e| AppError::internal(format!("monthly top query failed: {e}")))?;
-        let docs = cursor
-            .try_collect::<Vec<mongodb::bson::Document>>()
-            .await
-            .map_err(|e| AppError::internal(format!("monthly top read failed: {e}")))?;
-
-        let mut points: Vec<TopPoint> = Vec::new();
-        let mut uids: Vec<i64> = Vec::new();
-        for doc in docs {
-            if let Ok(arr) = doc.get_array("points") {
-                for item in arr {
-                    if let Ok(p) = bson::from_bson::<TopPoint>(item.clone()) {
-                        if since > 0 && p.time < since {
-                            continue;
-                        }
-                        if !uids.contains(&p.uid) {
-                            uids.push(p.uid);
-                        }
-                        points.push(p);
-                    }
-                }
-            }
-        }
-        points.sort_by_key(|p| p.time);
-
-        let players = if uids.is_empty() {
-            Vec::new()
-        } else {
-            let cursor = self
-                .players
-                .find(doc! { "server": server, "uid": { "$in": &uids } })
-                .await
-                .map_err(|e| AppError::internal(format!("players query failed: {e}")))?;
-            cursor
-                .try_collect::<Vec<PlayerDoc>>()
-                .await
-                .map_err(|e| AppError::internal(format!("players read failed: {e}")))?
-        };
-
-        Ok((points, players))
     }
 
-    /// Appends border cutoffs for `` from border users.
+    /// Appends border cutoffs for `server` and `monthly_id` from border users.
     pub async fn append_monthly_borders(
         &self,
         server: i64,
@@ -568,19 +492,22 @@ impl Storage {
         }
         let mut written = 0;
         for (tier, cutoffs) in by_tier {
-            self.upsert_cutoffs(
-                &self.monthly_border,
-                doc! { "server": server, "monthlyId": monthly_id, "tier": tier },
-                ts,
-                &cutoffs,
-            )
-            .await?;
-            written += cutoffs.len();
+            if self
+                .upsert_cutoffs(
+                    &self.monthly_border,
+                    doc! { "server": server, "monthlyId": monthly_id, "tier": tier },
+                    ts,
+                    &cutoffs,
+                )
+                .await?
+            {
+                written += cutoffs.len();
+            }
         }
         Ok(written)
     }
 
-    /// Border cutoff history for ``.
+    /// Border cutoff history for `server`, `monthly_id`, and `tier`.
     pub async fn monthly_border(
         &self,
         server: i64,
@@ -598,8 +525,8 @@ impl Storage {
     // Event snapshots
     // -----------------------------------------------------------------------
 
-    /// Appends a top snapshot for server, eventId and mid where mid = 0 means
-    /// the event-wide ranking, and upserts player profiles.
+    /// Appends a top snapshot for `server`, `event_id` and `mid` where `mid = 0`
+    /// means the event-wide ranking, and upserts player profiles.
     pub async fn append_event_top(
         &self,
         server: i64,
@@ -610,12 +537,6 @@ impl Storage {
     ) -> AppResult<usize> {
         let bucket = utc_bucket(ts);
         let filter = doc! { "server": server, "eventId": event_id, "mid": mid, "bucket": bucket };
-        let existing = self
-            .event_top
-            .find_one(filter.clone())
-            .await
-            .map_err(|e| AppError::internal(format!("event top query failed: {e}")))?;
-
         let points: Vec<TopPoint> = users
             .iter()
             .map(|u| TopPoint {
@@ -627,50 +548,25 @@ impl Storage {
         let points_bson = serde_to_bson(&points)?;
         let n = points.len();
 
-        match existing {
-            None => {
-                let doc = doc! {
-                    "server": server, "eventId": event_id, "mid": mid, "bucket": bucket,
-                    "points": points_bson,
-                    "updatedAt": ts,
-                };
-                self.event_top
-                    .insert_one(doc)
-                    .await
-                    .map_err(|e| AppError::internal(format!("event top insert failed: {e}")))?;
-            }
-            Some(doc) => {
-                let last = doc.get_i64("updatedAt").unwrap_or(0);
-                let update = if last < ts {
-                    doc! {
-                        "$set": { "updatedAt": ts },
-                        "$push": { "points": { "$each": points_bson } },
-                    }
-                } else {
-                    doc! { "$set": { "points": points_bson, "updatedAt": ts } }
-                };
-                self.event_top
-                    .update_one(filter, update)
-                    .await
-                    .map_err(|e| AppError::internal(format!("event top update failed: {e}")))?;
-            }
+        let wrote = self
+            .upsert_time_series(
+                &self.event_top,
+                filter,
+                "points",
+                ts,
+                points_bson,
+                "event top",
+            )
+            .await?;
+        if !wrote {
+            return Ok(0);
         }
 
-        let writes = users.iter().map(|u| {
-            let p = PlayerDoc::from_user(server, u, ts);
-            self.players
-                .replace_one(doc! { "server": server, "uid": u.uid }, p)
-                .upsert(true)
-        });
-        for w in writes {
-            w.await
-                .map_err(|e| AppError::internal(format!("player upsert failed: {e}")))?;
-        }
-
+        self.upsert_players(server, users, ts).await?;
         Ok(n)
     }
 
-    /// Full event top history for ``.
+    /// Full event top history for `server`, `event_id`, and `mid`.
     pub async fn event_top(
         &self,
         server: i64,
@@ -679,57 +575,30 @@ impl Storage {
         since: i64,
     ) -> AppResult<(Vec<TopPoint>, Vec<PlayerDoc>)> {
         let filter = if since > 0 {
-            doc! { "server": server, "eventId": event_id, "mid": mid, "bucket": { "$gte": since / 86_400_000 } }
+            doc! { "server": server, "eventId": event_id, "mid": mid, "bucket": { "$gte": utc_bucket(since) } }
         } else {
             doc! { "server": server, "eventId": event_id, "mid": mid }
         };
-        let cursor = self
-            .event_top
-            .find(filter)
+        self.query_top_points(&self.event_top, filter, server, since, "event top")
             .await
-            .map_err(|e| AppError::internal(format!("event top query failed: {e}")))?;
-        let docs = cursor
-            .try_collect::<Vec<mongodb::bson::Document>>()
-            .await
-            .map_err(|e| AppError::internal(format!("event top read failed: {e}")))?;
-
-        let mut points: Vec<TopPoint> = Vec::new();
-        let mut uids: Vec<i64> = Vec::new();
-        for doc in docs {
-            if let Ok(arr) = doc.get_array("points") {
-                for item in arr {
-                    if let Ok(p) = bson::from_bson::<TopPoint>(item.clone()) {
-                        if since > 0 && p.time < since {
-                            continue;
-                        }
-                        if !uids.contains(&p.uid) {
-                            uids.push(p.uid);
-                        }
-                        points.push(p);
-                    }
-                }
-            }
-        }
-        points.sort_by_key(|p| p.time);
-
-        let players = if uids.is_empty() {
-            Vec::new()
-        } else {
-            let cursor = self
-                .players
-                .find(doc! { "server": server, "uid": { "$in": &uids } })
-                .await
-                .map_err(|e| AppError::internal(format!("players query failed: {e}")))?;
-            cursor
-                .try_collect::<Vec<PlayerDoc>>()
-                .await
-                .map_err(|e| AppError::internal(format!("players read failed: {e}")))?
-        };
-
-        Ok((points, players))
     }
 
-    /// Appends border cutoffs for ``.
+    /// Returns whether any top-point snapshot exists for `(server, event_id, mid)`.
+    pub async fn has_event_top(&self, server: i64, event_id: i64, mid: i64) -> AppResult<bool> {
+        let doc = self
+            .event_top
+            .find_one(doc! {
+                "server": server,
+                "eventId": event_id,
+                "mid": mid,
+                "points.0": { "$exists": true },
+            })
+            .await
+            .map_err(|e| AppError::internal(format!("event top existence check failed: {e}")))?;
+        Ok(doc.is_some())
+    }
+
+    /// Appends border cutoffs for `server`, `event_id`, and `mid`.
     pub async fn append_event_borders(
         &self,
         server: i64,
@@ -755,19 +624,22 @@ impl Storage {
         }
         let mut written = 0;
         for (tier, cutoffs) in by_tier {
-            self.upsert_cutoffs(
-                &self.event_border,
-                doc! { "server": server, "eventId": event_id, "mid": mid, "tier": tier },
-                ts,
-                &cutoffs,
-            )
-            .await?;
-            written += cutoffs.len();
+            if self
+                .upsert_cutoffs(
+                    &self.event_border,
+                    doc! { "server": server, "eventId": event_id, "mid": mid, "tier": tier },
+                    ts,
+                    &cutoffs,
+                )
+                .await?
+            {
+                written += cutoffs.len();
+            }
         }
         Ok(written)
     }
 
-    /// Border cutoff history for ``.
+    /// Border cutoff history for `server`, `event_id`, `mid`, and `tier`.
     pub async fn event_border(
         &self,
         server: i64,
@@ -783,50 +655,120 @@ impl Storage {
     }
 
     // -----------------------------------------------------------------------
-    // Shared cutoff helpers
+    // Shared time-series and player helpers
     // -----------------------------------------------------------------------
 
+    async fn upsert_players(&self, server: i64, users: &[RankingUser], ts: i64) -> AppResult<()> {
+        for u in users {
+            let p = PlayerDoc::from_user(server, u, ts);
+            self.players
+                .replace_one(doc! { "server": server, "uid": u.uid }, p)
+                .upsert(true)
+                .await
+                .map_err(|e| AppError::internal(format!("player upsert failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn query_top_points(
+        &self,
+        coll: &Collection<mongodb::bson::Document>,
+        filter: mongodb::bson::Document,
+        server: i64,
+        since: i64,
+        label: &str,
+    ) -> AppResult<(Vec<TopPoint>, Vec<PlayerDoc>)> {
+        let cursor = coll
+            .find(filter)
+            .await
+            .map_err(|e| AppError::internal(format!("{label} query failed: {e}")))?;
+        let docs = cursor
+            .try_collect::<Vec<mongodb::bson::Document>>()
+            .await
+            .map_err(|e| AppError::internal(format!("{label} read failed: {e}")))?;
+
+        let (points, uids) = extract_top_points(&docs, since);
+        let players = if uids.is_empty() {
+            Vec::new()
+        } else {
+            let cursor = self
+                .players
+                .find(doc! { "server": server, "uid": { "$in": &uids } })
+                .await
+                .map_err(|e| AppError::internal(format!("players query failed: {e}")))?;
+            cursor
+                .try_collect::<Vec<PlayerDoc>>()
+                .await
+                .map_err(|e| AppError::internal(format!("players read failed: {e}")))?
+        };
+
+        Ok((points, players))
+    }
+
+    /// Idempotent time-series upsert: inserts when missing, appends when `ts`
+    /// is newer than `updatedAt`, replaces only entries with `time == ts` when
+    /// `ts == updatedAt` (preserving earlier snapshots), and skips when stale.
+    async fn upsert_time_series(
+        &self,
+        coll: &Collection<mongodb::bson::Document>,
+        filter: mongodb::bson::Document,
+        array_field: &str,
+        ts: i64,
+        items_bson: mongodb::bson::Bson,
+        label: &str,
+    ) -> AppResult<bool> {
+        let existing = coll
+            .find_one(filter.clone())
+            .await
+            .map_err(|e| AppError::internal(format!("{label} query failed: {e}")))?;
+        let existing_updated_at = existing
+            .as_ref()
+            .map(|doc| doc.get_i64("updatedAt").unwrap_or(0));
+
+        match decide_snapshot_action(existing_updated_at, ts) {
+            SnapshotAction::Insert => {
+                let doc = build_insert_doc(&filter, array_field, ts, items_bson);
+                coll.insert_one(doc)
+                    .await
+                    .map_err(|e| AppError::internal(format!("{label} insert failed: {e}")))?;
+                Ok(true)
+            }
+            SnapshotAction::Append => {
+                let update = build_append_update(array_field, ts, items_bson);
+                coll.update_one(filter, update)
+                    .await
+                    .map_err(|e| AppError::internal(format!("{label} update failed: {e}")))?;
+                Ok(true)
+            }
+            SnapshotAction::ReplaceAtTs => {
+                // MongoDB rejects $pull and $push on the same array field in a
+                // single update document, so pull `time == ts` before pushing.
+                let pull = build_pull_at_ts_update(array_field, ts);
+                coll.update_one(filter.clone(), pull)
+                    .await
+                    .map_err(|e| AppError::internal(format!("{label} pull failed: {e}")))?;
+                let push = build_append_update(array_field, ts, items_bson);
+                coll.update_one(filter, push)
+                    .await
+                    .map_err(|e| AppError::internal(format!("{label} update failed: {e}")))?;
+                Ok(true)
+            }
+            SnapshotAction::Skip => Ok(false),
+        }
+    }
+
     /// Idempotent cutoff series upsert: appends when `ts` is newer, replaces
-    /// when `ts` equals the stored `updatedAt`.
+    /// only entries at `ts` when `ts` equals `updatedAt`, skips when older.
     async fn upsert_cutoffs(
         &self,
         coll: &Collection<mongodb::bson::Document>,
         filter: mongodb::bson::Document,
         ts: i64,
         cutoffs: &[CutoffPoint],
-    ) -> AppResult<()> {
-        let existing = coll
-            .find_one(filter.clone())
-            .await
-            .map_err(|e| AppError::internal(format!("cutoff query failed: {e}")))?;
+    ) -> AppResult<bool> {
         let cutoffs_bson = serde_to_bson(cutoffs)?;
-
-        match existing {
-            None => {
-                let mut doc = doc! { "cutoffs": cutoffs_bson, "updatedAt": ts };
-                for (k, v) in filter.clone().into_iter() {
-                    doc.insert(k, v);
-                }
-                coll.insert_one(doc)
-                    .await
-                    .map_err(|e| AppError::internal(format!("cutoff insert failed: {e}")))?;
-            }
-            Some(doc) => {
-                let last = doc.get_i64("updatedAt").unwrap_or(0);
-                let update = if last < ts {
-                    doc! {
-                        "$set": { "updatedAt": ts },
-                        "$push": { "cutoffs": { "$each": cutoffs_bson } },
-                    }
-                } else {
-                    doc! { "$set": { "cutoffs": cutoffs_bson, "updatedAt": ts } }
-                };
-                coll.update_one(filter, update)
-                    .await
-                    .map_err(|e| AppError::internal(format!("cutoff update failed: {e}")))?;
-            }
-        }
-        Ok(())
+        self.upsert_time_series(coll, filter, "cutoffs", ts, cutoffs_bson, "cutoff")
+            .await
     }
 
     async fn query_cutoffs(
@@ -853,6 +795,74 @@ impl Storage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotAction {
+    Insert,
+    Append,
+    ReplaceAtTs,
+    Skip,
+}
+
+fn decide_snapshot_action(existing_updated_at: Option<i64>, ts: i64) -> SnapshotAction {
+    match existing_updated_at {
+        None => SnapshotAction::Insert,
+        Some(last) if last < ts => SnapshotAction::Append,
+        Some(last) if last == ts => SnapshotAction::ReplaceAtTs,
+        Some(_) => SnapshotAction::Skip,
+    }
+}
+
+fn build_insert_doc(
+    filter: &mongodb::bson::Document,
+    array_field: &str,
+    ts: i64,
+    items_bson: mongodb::bson::Bson,
+) -> mongodb::bson::Document {
+    let mut doc = doc! { array_field: items_bson, "updatedAt": ts };
+    for (k, v) in filter.iter() {
+        doc.insert(k.clone(), v.clone());
+    }
+    doc
+}
+
+fn build_pull_at_ts_update(array_field: &str, ts: i64) -> mongodb::bson::Document {
+    doc! { "$pull": { array_field: { "time": ts } } }
+}
+
+fn build_append_update(
+    array_field: &str,
+    ts: i64,
+    items_bson: mongodb::bson::Bson,
+) -> mongodb::bson::Document {
+    doc! {
+        "$set": { "updatedAt": ts },
+        "$push": { array_field: { "$each": items_bson } },
+    }
+}
+
+fn extract_top_points(docs: &[mongodb::bson::Document], since: i64) -> (Vec<TopPoint>, Vec<i64>) {
+    let mut points: Vec<TopPoint> = Vec::new();
+    let mut uids: Vec<i64> = Vec::new();
+    let mut seen_uids: HashSet<i64> = HashSet::new();
+    for doc in docs {
+        if let Ok(arr) = doc.get_array("points") {
+            for item in arr {
+                if let Ok(p) = bson::from_bson::<TopPoint>(item.clone()) {
+                    if since > 0 && p.time < since {
+                        continue;
+                    }
+                    if seen_uids.insert(p.uid) {
+                        uids.push(p.uid);
+                    }
+                    points.push(p);
+                }
+            }
+        }
+    }
+    points.sort_by_key(|p| p.time);
+    (points, uids)
+}
+
 /// Per-UTC-day bucket index: `ts / 86_400_000`.
 ///
 /// GarupaSpeedTracker buckets by 8 days, which is sized for a 5-minute poll
@@ -866,4 +876,91 @@ fn utc_bucket(ts: i64) -> i64 {
 
 fn serde_to_bson<T: serde::Serialize + ?Sized>(value: &T) -> AppResult<mongodb::bson::Bson> {
     bson::to_bson(value).map_err(|e| AppError::internal(format!("bson serialize failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decides_snapshot_action_for_missing_newer_equal_and_stale_timestamps() {
+        assert_eq!(decide_snapshot_action(None, 1_000), SnapshotAction::Insert);
+        assert_eq!(
+            decide_snapshot_action(Some(900), 1_000),
+            SnapshotAction::Append
+        );
+        assert_eq!(
+            decide_snapshot_action(Some(1_000), 1_000),
+            SnapshotAction::ReplaceAtTs
+        );
+        assert_eq!(
+            decide_snapshot_action(Some(1_100), 1_000),
+            SnapshotAction::Skip
+        );
+    }
+
+    #[test]
+    fn pull_and_append_updates_preserve_earlier_entries_and_avoid_operator_conflict() {
+        let pull = build_pull_at_ts_update("cutoffs", 2_000);
+        assert_eq!(pull, doc! { "$pull": { "cutoffs": { "time": 2_000_i64 } } });
+        assert!(!pull.contains_key("$push"));
+        assert!(!pull.contains_key("$set"));
+
+        let items = serde_to_bson(&[CutoffPoint {
+            time: 2_000,
+            ep: 123_456,
+        }])
+        .unwrap();
+        let append = build_append_update("cutoffs", 2_000, items.clone());
+        assert_eq!(
+            append,
+            doc! {
+                "$set": { "updatedAt": 2_000_i64 },
+                "$push": { "cutoffs": { "$each": items } },
+            }
+        );
+        assert!(!append.contains_key("$pull"));
+    }
+
+    #[test]
+    fn insert_doc_copies_filter_keys_and_sets_initial_series() {
+        let filter = doc! { "server": 0_i64, "eventId": 42_i64, "mid": 0_i64, "tier": 1000_i64 };
+        let items = serde_to_bson(&[CutoffPoint {
+            time: 5_000,
+            ep: 9_999,
+        }])
+        .unwrap();
+        let inserted = build_insert_doc(&filter, "cutoffs", 5_000, items.clone());
+        assert_eq!(inserted.get_i64("server").unwrap(), 0);
+        assert_eq!(inserted.get_i64("eventId").unwrap(), 42);
+        assert_eq!(inserted.get_i64("mid").unwrap(), 0);
+        assert_eq!(inserted.get_i64("tier").unwrap(), 1000);
+        assert_eq!(inserted.get_i64("updatedAt").unwrap(), 5_000);
+        assert_eq!(inserted.get("cutoffs"), Some(&items));
+    }
+
+    #[test]
+    fn extract_top_points_filters_since_sorts_and_deduplicates_uids() {
+        let docs = vec![
+            doc! {
+                "points": [
+                    { "time": 200_i64, "uid": 2_i64, "value": 20_i64 },
+                    { "time": 100_i64, "uid": 1_i64, "value": 10_i64 },
+                ]
+            },
+            doc! {
+                "points": [
+                    { "time": 150_i64, "uid": 1_i64, "value": 15_i64 },
+                    { "time": 150_i64, "uid": 3_i64, "value": 30_i64 },
+                ]
+            },
+        ];
+
+        let (points, uids) = extract_top_points(&docs, 150);
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0].time, 150);
+        assert_eq!(points[1].time, 150);
+        assert_eq!(points[2].time, 200);
+        assert_eq!(uids, vec![2, 1, 3]);
+    }
 }

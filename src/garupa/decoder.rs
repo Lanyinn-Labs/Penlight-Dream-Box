@@ -49,7 +49,7 @@ fn read_varint(buf: &[u8], offset: usize) -> Option<(u64, usize)> {
             return Some((value, cursor));
         }
         shift += 7;
-        if shift > 56 {
+        if shift > 63 {
             return None;
         }
     }
@@ -67,7 +67,9 @@ fn parse_raw_fields(buf: &[u8]) -> Vec<RawField> {
             None => break,
         };
         offset = next;
-        let field = (key >> 3) as u32;
+        let Ok(field) = u32::try_from(key >> 3) else {
+            break;
+        };
         if field == 0 {
             break;
         }
@@ -86,15 +88,18 @@ fn parse_raw_fields(buf: &[u8]) -> Vec<RawField> {
                 });
             }
             1 => {
-                if offset + 8 > buf.len() {
+                let Some(end) = offset.checked_add(8) else {
+                    break;
+                };
+                if end > buf.len() {
                     break;
                 }
                 fields.push(RawField {
                     field,
                     wire_type: WireType::Fixed64,
-                    data: RawData::Bytes(buf[offset..offset + 8].to_vec()),
+                    data: RawData::Bytes(buf[offset..end].to_vec()),
                 });
-                offset += 8;
+                offset = end;
             }
             2 => {
                 let (length, next) = match read_varint(buf, offset) {
@@ -102,27 +107,35 @@ fn parse_raw_fields(buf: &[u8]) -> Vec<RawField> {
                     None => break,
                 };
                 offset = next;
-                let length = length as usize;
-                if offset + length > buf.len() {
+                let Ok(length) = usize::try_from(length) else {
+                    break;
+                };
+                let Some(end) = offset.checked_add(length) else {
+                    break;
+                };
+                if end > buf.len() {
                     break;
                 }
                 fields.push(RawField {
                     field,
                     wire_type: WireType::LengthDelimited,
-                    data: RawData::Bytes(buf[offset..offset + length].to_vec()),
+                    data: RawData::Bytes(buf[offset..end].to_vec()),
                 });
-                offset += length;
+                offset = end;
             }
             5 => {
-                if offset + 4 > buf.len() {
+                let Some(end) = offset.checked_add(4) else {
+                    break;
+                };
+                if end > buf.len() {
                     break;
                 }
                 fields.push(RawField {
                     field,
                     wire_type: WireType::Fixed32,
-                    data: RawData::Bytes(buf[offset..offset + 4].to_vec()),
+                    data: RawData::Bytes(buf[offset..end].to_vec()),
                 });
-                offset += 4;
+                offset = end;
             }
             _ => break,
         }
@@ -169,4 +182,84 @@ pub fn decode(buf: &[u8], schema: &Schema) -> Result<Value, ProtoError> {
     }
 
     Ok(Value::Object(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::garupa::schema::{field, ProtoType, Schema};
+
+    fn encode_varint(mut value: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            bytes.push(byte);
+            if value == 0 {
+                return bytes;
+            }
+        }
+    }
+
+    fn encode_varint_field(field_num: u32, value: u64) -> Vec<u8> {
+        let mut out = encode_varint(u64::from(field_num) << 3);
+        out.extend(encode_varint(value));
+        out
+    }
+
+    fn encode_bytes_field(field_num: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = encode_varint((u64::from(field_num) << 3) | 2);
+        out.extend(encode_varint(data.len() as u64));
+        out.extend(data);
+        out
+    }
+
+    #[test]
+    fn decodes_10_byte_negative_and_bit63_varints_without_dropping_subsequent_fields() {
+        static TEST_SCHEMA: Schema = Schema {
+            fields: &[
+                (1, field("negOne", ProtoType::Int, false)),
+                (2, field("minLong", ProtoType::Long, false)),
+                (3, field("after", ProtoType::String, false)),
+            ],
+        };
+
+        let mut payload = encode_varint_field(1, (-1i64) as u64);
+        payload.extend(encode_varint_field(2, i64::MIN as u64));
+        payload.extend(encode_bytes_field(3, b"kept"));
+
+        let decoded = decode(&payload, &TEST_SCHEMA).unwrap();
+        assert_eq!(decoded["negOne"], -1);
+        assert_eq!(decoded["minLong"], i64::MIN);
+        assert_eq!(decoded["after"], "kept");
+    }
+
+    #[test]
+    fn rejects_overlong_varint_more_than_10_bytes() {
+        let overlong = [0x80u8; 11];
+        assert!(read_varint(&overlong, 0).is_none());
+    }
+
+    #[test]
+    fn corrupt_huge_length_delimited_field_does_not_overflow_or_panic() {
+        static TEST_SCHEMA: Schema = Schema {
+            fields: &[
+                (1, field("ok", ProtoType::Int, false)),
+                (2, field("corrupt", ProtoType::String, false)),
+            ],
+        };
+
+        let mut payload = encode_varint_field(1, 42);
+        // Field 2 wire type 2 (length-delimited) with length = u64::MAX
+        payload.extend(encode_varint((2u64 << 3) | 2));
+        payload.extend(encode_varint(u64::MAX));
+        payload.extend(b"trailing");
+
+        let decoded = decode(&payload, &TEST_SCHEMA).unwrap();
+        assert_eq!(decoded["ok"], 42);
+        assert!(decoded.get("corrupt").is_none());
+    }
 }

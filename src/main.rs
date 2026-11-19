@@ -38,7 +38,10 @@ async fn main() {
     let storage = match Storage::connect(&cfg.mongodb_uri, &cfg.mongodb_db).await {
         Ok(s) => s,
         Err(e) => {
-            error!("failed to connect to MongoDB at {}: {e}", cfg.mongodb_uri);
+            error!(
+                "failed to connect to MongoDB at {}: {e}",
+                redact_mongodb_uri(&cfg.mongodb_uri)
+            );
             std::process::exit(1);
         }
     };
@@ -113,4 +116,44 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received, exiting");
+}
+
+fn redact_mongodb_uri(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return match uri.rsplit_once('@') {
+            Some((_, host)) => format!("***@{host}"),
+            None => uri.to_string(),
+        };
+    };
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{suffix}"),
+        None => uri.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_mongodb_uri;
+
+    #[test]
+    fn redacts_mongodb_credentials_while_preserving_host_and_query() {
+        assert_eq!(
+            redact_mongodb_uri("mongodb://127.0.0.1:27017"),
+            "mongodb://127.0.0.1:27017"
+        );
+        assert_eq!(
+            redact_mongodb_uri("mongodb://alice:s3cr3t@mongo:27017/penlight_box?authSource=admin"),
+            "mongodb://***@mongo:27017/penlight_box?authSource=admin"
+        );
+        assert_eq!(
+            redact_mongodb_uri("mongodb+srv://user:p@ss:word@cluster.example.net/db"),
+            "mongodb+srv://***@cluster.example.net/db"
+        );
+        assert_eq!(
+            redact_mongodb_uri("mongodb://host:27017/?appName=foo@bar"),
+            "mongodb://host:27017/?appName=foo@bar"
+        );
+    }
 }

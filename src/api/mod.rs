@@ -91,15 +91,73 @@ pub fn build_router(state: AppState, cfg: &Config) -> Router {
         ));
 
     // Health check outside the API prefix.
-    Router::new()
+    let router = Router::new()
         .route("/", get(web::index))
         .route("/assets/app.css", get(web::styles))
         .route("/assets/app.js", get(web::script))
         .route(
             "/health",
             get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
-        )
-        .nest(&cfg.api_prefix, api)
+        );
+    let prefix = cfg.api_prefix.as_str();
+    mount_api_router(router, api, prefix)
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
+}
+
+fn mount_api_router<S: Clone + Send + Sync + 'static>(
+    root: Router<S>,
+    api: Router<S>,
+    api_prefix: &str,
+) -> Router<S> {
+    let prefix = api_prefix.trim().trim_matches('/');
+    if prefix.is_empty() {
+        root.merge(api)
+    } else {
+        root.nest(&format!("/{prefix}"), api)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mount_api_router_handles_root_prefix_without_panicking() {
+        for prefix in ["/", "", "///", "/api", "custom/"] {
+            let root = Router::new().route("/health", get(|| async { "ok" }));
+            let api = Router::new().route("/ping", get(|| async { "pong" }));
+            let app = mount_api_router(root, api, prefix);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let client = reqwest::Client::new();
+            let health = client
+                .get(format!("http://{addr}/health"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+            let trimmed = prefix.trim().trim_matches('/');
+            let api_path = if trimmed.is_empty() {
+                "/ping".to_string()
+            } else {
+                format!("/{trimmed}/ping")
+            };
+            let ping = client
+                .get(format!("http://{addr}{api_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ping.status(), reqwest::StatusCode::OK);
+            assert_eq!(ping.text().await.unwrap(), "pong");
+
+            server.abort();
+        }
+    }
 }
